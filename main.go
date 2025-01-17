@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
@@ -19,6 +20,13 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	conn *websocket.Conn
 	send chan []byte
+	id   string // クライアントを識別するためのID（アドレス等でも可）
+}
+
+type Message struct {
+	Sender  string `json:"sender"`
+	Content string `json:"content"`
+	Time    string `json:"time"`
 }
 
 // 接続中のクライアントを管理
@@ -55,7 +63,14 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	client := &Client{conn: conn, send: make(chan []byte)}
+	// クライアントを識別するためのIDとして接続元のアドレスを利用
+	client := &Client{
+		conn: conn,
+		send: make(chan []byte),
+		id:   conn.RemoteAddr().String(),
+	}
+
+	// クライアントをリストに追加
 	mutex.Lock()
 	clients[client] = true
 	mutex.Unlock()
@@ -63,7 +78,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	// 非同期でメッセージを送信
 	go client.writeMessage()
 
-	fmt.Println("New WebSocket connection")
+	fmt.Println("New WebSocket connection from", client.id)
 
 	for {
 		// メッセージを読み取る
@@ -77,26 +92,48 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// メッセージをサーバー側でログ出力
-		fmt.Println("Received message: ", string(msg))
+		fmt.Println("Received message from", client.id, ": ", string(msg))
+
+		// メッセージをサーバーに渡す
+		message := Message{
+			Sender:  client.id,
+			Content: string(msg),
+			// Time:    time.Now().Format(time.RFC3339),
+		}
+		// メッセージをJSON形式にエンコード
+		encodedMsg, err := json.Marshal(message)
+		if err != nil {
+			fmt.Println("Error marshalling message:", err)
+			continue
+		}
 
 		// メッセージをブロードキャスト
-		broadcast <- msg
+		broadcast <- encodedMsg
 	}
 }
 
-// メッセージを全クライアントに送信
+// メッセージを全クライアントに送信（送信元のクライアントには送信しない）
 func handleMessages() {
 	for {
 		msg := <-broadcast
 		mutex.Lock()
 		for client := range clients {
-			select {
-			case client.send <- msg:
-				// メッセージ送信成功
-			default:
-				// メッセージ送信に失敗した場合、クライアントを削除
-				delete(clients, client)
-				close(client.send) // チャネルを閉じる
+			// メッセージ送信元のクライアントを除外
+			// msg.Sender と client.id を比較して送信元を判定
+			var message Message
+			err := json.Unmarshal(msg, &message)
+			if err != nil {
+				fmt.Println("Error unmarshalling message:", err)
+				continue
+			}
+
+			if message.Sender != client.id { // 自分には送信しない
+				select {
+				case client.send <- msg:
+				default:
+					delete(clients, client)
+					close(client.send) // チャネルを閉じる
+				}
 			}
 		}
 		mutex.Unlock()
